@@ -22,6 +22,7 @@ OUTPUT_DIR="${PROJECT_ROOT}/output/training_demo/deepseek_v41"
 ASSETS_PATH="${OUTPUT_DIR}/engram_validation.json"
 DEFAULT_DATA_PATH="${OUTPUT_DIR}/mm_data/deepseek_v41_messages/train.jsonl"
 RUN_NAME=${RUN_NAME:-vlm_tp1_ep16}
+NPROC_PER_NODE=${NPROC_PER_NODE:-16}
 
 if [[ ! ${RUN_NAME} =~ ^[A-Za-z0-9._-]+$ ]]; then
     echo "RUN_NAME may contain only letters, digits, dots, underscores, and hyphens" >&2
@@ -73,9 +74,9 @@ if [[ ! -s "${ASSETS_PATH}" ]]; then
         --num-hidden-layers 4
 fi
 
-torchrun \
+python -m torch.distributed.run \
     --standalone \
-    --nproc_per_node=16 \
+    --nproc_per_node="${NPROC_PER_NODE}" \
     "${PROJECT_ROOT}/scripts/train_vl.py" \
     "${SCRIPT_DIR}/train_deepseek_v41_vlm_online.yaml" \
     --model.config_path="${MODEL_PATH}" \

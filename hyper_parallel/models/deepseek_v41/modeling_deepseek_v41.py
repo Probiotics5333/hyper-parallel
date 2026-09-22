@@ -43,7 +43,7 @@ from transformers.models.deepseek_v4.modeling_deepseek_v4 import (
 
 from hyper_parallel.core.dtensor.layout import infer_slice_area_by_layout
 from hyper_parallel.components.modules.engram import NgramHashMapping
-from hyper_parallel.components.modules.mhc import pipelined_mhc_post
+from hyper_parallel.components.modules.mhc import HyperMegaMhcModule, pipelined_mhc_post
 from hyper_parallel.components.modules.shared_compressed_dsa_attention import (
     SharedCompressedAttentionCPContext as SharedAttentionCPContext,
     SharedCompressedPackedSequence as SharedPackedSequence,
@@ -303,6 +303,14 @@ def _hc_post(
     return pipelined_mhc_post(sublayer_output, residual, post, comb)
 
 
+def _identity_residual_mix(reference: torch.Tensor) -> torch.Tensor:
+    """Build a batch-broadcast identity mapping matching pre-mix leading dimensions."""
+    num_stream = reference.shape[-1]
+    identity = torch.eye(num_stream, dtype=reference.dtype, device=reference.device)
+    view_shape = (1,) * (reference.ndim - 1) + (num_stream, num_stream)
+    return identity.view(view_shape).expand(*reference.shape[:-1], num_stream, num_stream)
+
+
 def _v41_decoder_layer_forward(
         self: nn.Module,
         hidden_states: torch.Tensor,
@@ -316,9 +324,72 @@ def _v41_decoder_layer_forward(
         segment_starts: torch.Tensor | None,
         engram_token_mask: torch.Tensor | None = None,
         image_mask: torch.Tensor | None = None,
+        previous_output: torch.Tensor | None = None,
+        previous_post_mix: torch.Tensor | None = None,
+        previous_residual_mix: torch.Tensor | None = None,
         **kwargs: Any,
-) -> tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, ...]:
     """Run one V4.1 block while preserving the decoder module call boundary."""
+    use_hyper_mega_mhc = isinstance(self.attn_hc, HyperMegaMhcModule)
+    if use_hyper_mega_mhc != isinstance(self.ffn_hc, HyperMegaMhcModule):
+        raise RuntimeError("attention and FFN mHC replacements must use the same implementation")
+    if use_hyper_mega_mhc:
+        if previous_output is None or previous_post_mix is None or previous_residual_mix is None:
+            raise ValueError("HyperMegaMhc decoder state is incomplete")
+        if hasattr(self, "engram"):
+            hidden_states = _hc_post(
+                previous_output,
+                hidden_states,
+                previous_post_mix,
+                previous_residual_mix,
+            )
+            hidden_states = self.engram(
+                hidden_states,
+                input_ids,
+                segment_starts,
+                token_mask=engram_token_mask,
+            )
+            previous_output = torch.zeros_like(previous_output)
+            previous_post_mix = torch.zeros_like(previous_post_mix)
+            previous_residual_mix = _identity_residual_mix(pre_mix)
+
+        (
+            residual,
+            attention_pre,
+            attention_post,
+            attention_comb,
+            attention_input,
+        ) = self.attn_hc.advance(
+            previous_output,
+            hidden_states,
+            pre_mix,
+            previous_post_mix,
+            previous_residual_mix,
+            self.input_layernorm.weight,
+        )
+        attention_output, _ = self.self_attn(
+            attention_input,
+            position_embeddings=position_embeddings,
+            position_ids=position_ids,
+            attention_mask=attention_mask,
+            past_key_values=None,
+            shared_attention_state=shared_attention_state,
+            **kwargs,
+        )
+        residual, ffn_pre, ffn_post, ffn_comb, ffn_input = self.ffn_hc.advance(
+            attention_output,
+            residual,
+            attention_pre,
+            attention_post,
+            attention_comb,
+            self.post_attention_layernorm.weight,
+        )
+        if image_mask is None:
+            ffn_output = self.mlp(ffn_input, input_ids=input_ids)
+        else:
+            ffn_output = self.mlp(ffn_input, input_ids=input_ids, image_mask=image_mask)
+        return ffn_output, residual, ffn_pre, ffn_post, ffn_comb
+
     if hasattr(self, "engram"):
         hidden_states = self.engram(
             hidden_states,
@@ -558,20 +629,50 @@ class DeepseekV41CroppedModel(DeepseekV4PreTrainedModel):
         pre_mix = hidden_states.new_zeros(*hidden_states.shape[:2], self.config.hc_mult, dtype=torch.float32)
         pre_mix[:, :, 0] = 1.0
         shared_state = SharedAttentionState()
-        for layer in self.layers:
-            hidden_states, pre_mix = layer(
-                hidden_states,
-                pre_mix=pre_mix,
-                input_ids=input_ids,
-                position_embeddings=position_embeddings,
-                position_ids=position_ids,
-                attention_mask=attention_mask,
-                shared_attention_state=shared_state,
-                segment_starts=segment_start_mask,
-                engram_token_mask=engram_token_mask,
-                image_mask=image_mask,
-                **kwargs,
-            )
+        hyper_mega_mhc_layers = [
+            isinstance(layer.attn_hc, HyperMegaMhcModule)
+            and isinstance(layer.ffn_hc, HyperMegaMhcModule)
+            for layer in self.layers
+        ]
+        if any(hyper_mega_mhc_layers) and not all(hyper_mega_mhc_layers):
+            raise RuntimeError("HyperMegaMhc must replace every retained V4.1 mHC module")
+        if all(hyper_mega_mhc_layers):
+            previous_output = torch.zeros_like(inputs_embeds)
+            post_mix = torch.zeros_like(pre_mix)
+            residual_mix = _identity_residual_mix(pre_mix)
+            for layer in self.layers:
+                previous_output, hidden_states, pre_mix, post_mix, residual_mix = layer(
+                    hidden_states,
+                    pre_mix=pre_mix,
+                    previous_output=previous_output,
+                    previous_post_mix=post_mix,
+                    previous_residual_mix=residual_mix,
+                    input_ids=input_ids,
+                    position_embeddings=position_embeddings,
+                    position_ids=position_ids,
+                    attention_mask=attention_mask,
+                    shared_attention_state=shared_state,
+                    segment_starts=segment_start_mask,
+                    engram_token_mask=engram_token_mask,
+                    image_mask=image_mask,
+                    **kwargs,
+                )
+            hidden_states = _hc_post(previous_output, hidden_states, post_mix, residual_mix)
+        else:
+            for layer in self.layers:
+                hidden_states, pre_mix = layer(
+                    hidden_states,
+                    pre_mix=pre_mix,
+                    input_ids=input_ids,
+                    position_embeddings=position_embeddings,
+                    position_ids=position_ids,
+                    attention_mask=attention_mask,
+                    shared_attention_state=shared_state,
+                    segment_starts=segment_start_mask,
+                    engram_token_mask=engram_token_mask,
+                    image_mask=image_mask,
+                    **kwargs,
+                )
         hidden_states = self.norm(_hc_pre(hidden_states, pre_mix))
         return MoeModelOutputWithPast(last_hidden_state=hidden_states)
 

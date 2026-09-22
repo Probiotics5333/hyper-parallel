@@ -41,7 +41,7 @@ from transformers.models.deepseek_v4.configuration_deepseek_v4 import (
 
 from hyper_parallel import init_empty_weights
 from hyper_parallel.components.modules.engram import EngramModule
-from hyper_parallel.components.modules.mhc import PipelinedMhcModule
+from hyper_parallel.components.modules.mhc import HyperMegaMhcModule, PipelinedMhcModule
 from hyper_parallel.components.modules.shared_compressed_dsa_attention import (
     SharedCompressedPackedSequence,
     SharedCompressedDSAAttention,
@@ -458,9 +458,11 @@ class TestDeepseekV41CroppedModel(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             model = DeepseekV41CroppedForCausalLM(_tiny_config(_write_engram_assets(directory)))
             engram_weight = model.model.layers[1].engram.embed.weight
+            mhc_weight = model.model.layers[0].attn_hc.fn
             replacement_plan = compile_module_replacements(model, rules)
             apply_module_replacements(model, replacement_plan, weights_mapping=[])
-        self.assertIsInstance(model.model.layers[0].attn_hc, PipelinedMhcModule)
+        self.assertIsInstance(model.model.layers[0].attn_hc, HyperMegaMhcModule)
+        self.assertIs(model.model.layers[0].attn_hc.fn, mhc_weight)
         self.assertIsInstance(model.model.layers[1].engram, EngramModule)
         self.assertIs(model.model.layers[1].engram.embed.weight, engram_weight)
 

@@ -21,6 +21,7 @@ PROJECT_ROOT=$(cd "${SCRIPT_DIR}/../.." && pwd)
 OUTPUT_DIR="${PROJECT_ROOT}/output/training_demo/deepseek_v41"
 ASSETS_PATH="${OUTPUT_DIR}/engram_validation.json"
 DATA_PATH="${OUTPUT_DIR}/online_4k.jsonl"
+NPROC_PER_NODE=${NPROC_PER_NODE:-16}
 
 if [[ $# -lt 2 ]]; then
     echo "Usage: $0 /path/to/DeepSeek-V4.1-Flash tp1|tp2|cp2 [trainer overrides...]" >&2
@@ -95,9 +96,9 @@ if [[ ! -s "${DATA_PATH}" ]]; then
         --sequence-length 4096
 fi
 
-torchrun \
+python -m torch.distributed.run \
     --standalone \
-    --nproc_per_node=16 \
+    --nproc_per_node="${NPROC_PER_NODE}" \
     --module examples.training_demo.train_text \
     "${SCRIPT_DIR}/train_deepseek_v41_online.yaml" \
     --model.config_path="${MODEL_PATH}" \

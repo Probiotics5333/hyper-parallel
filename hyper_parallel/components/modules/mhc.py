@@ -254,6 +254,65 @@ class PipelinedMhcModule(nn.Module):
         return pre, post, residual
 
 
+@module_replacement
+class HyperMegaMhcModule(PipelinedMhcModule):
+    """DeepSeek-compatible parameter owner for the fused multicore mHC boundary."""
+
+    def __init__(
+        self,
+        *,
+        module: nn.Module,
+        module_fqn: str = "",
+        context: Mapping[str, Any] | None = None,
+    ) -> None:
+        """Reuse the source ``fn/base/scale`` parameters without changing its state dict."""
+        super().__init__(module=module, module_fqn=module_fqn, context=context)
+        self.token_tile = 32
+
+    def advance(
+        self,
+        previous_output: torch.Tensor,
+        residual: torch.Tensor,
+        previous_pre_mix: torch.Tensor,
+        previous_post_mix: torch.Tensor,
+        previous_residual_mix: torch.Tensor,
+        norm_weight: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Advance one shifted boundary through HyperMegaMhc and HyperMegaMhcGrad."""
+        if self.hc_mult != 4 or self.hc_sinkhorn_iters != 20:
+            raise ValueError(
+                "HyperMegaMhcModule requires hc_mult=4 and hc_sinkhorn_iters=20, "
+                f"got hc_mult={self.hc_mult}, hc_sinkhorn_iters={self.hc_sinkhorn_iters}"
+            )
+        norm_eps = getattr(self.input_norm, "eps", None)
+        if norm_eps is None:
+            norm_eps = getattr(self.input_norm, "variance_epsilon", None)
+        if norm_eps is None:
+            raise TypeError("HyperMegaMhcModule input_norm must expose eps or variance_epsilon")
+
+        # Multicore is an optional NPU-only component; keep CPU model import and
+        # recipe inspection usable when its native dependencies are unavailable.
+        from hyper_parallel.core.multicore.modules.mega_mhc.function import (  # pylint: disable=C0415
+            hyper_mega_mhc,
+        )
+
+        return hyper_mega_mhc(
+            previous_output,
+            residual,
+            previous_pre_mix,
+            previous_post_mix,
+            previous_residual_mix,
+            self.fn.float(),
+            self.scale.float(),
+            self.base.float(),
+            norm_weight,
+            hc_eps=self.hc_eps,
+            norm_eps=float(norm_eps),
+            num_iters=self.hc_sinkhorn_iters,
+            token_tile=self.token_tile,
+        )
+
+
 def pipelined_mhc_post(
     sublayer_output: torch.Tensor,
     residual: torch.Tensor,

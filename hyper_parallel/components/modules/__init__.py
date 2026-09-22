@@ -30,6 +30,7 @@ _EXPORT_TO_MODULE = {
     "GatedGQAAttention": "gqa_attention",
     "EngramModule": "engram",
     "GroupedExperts": "grouped_experts",
+    "HyperMegaMhcModule": "mhc",
     "KimiDeltaAttention": "kimi_delta_attention",
     "KimiRMSNormGated": "kimi_delta_attention",
     "MhcPostModule": "mhc",

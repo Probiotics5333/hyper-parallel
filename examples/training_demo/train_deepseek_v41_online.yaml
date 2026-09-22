@@ -45,7 +45,7 @@ fsdp_config:
   mix_precision:
     param_dtype: bfloat16
     reduce_dtype: float32
-    output_dtype: bfloat16
+    output_dtype: null
     cast_forward_inputs: false
   reshard_after_forward: true
   reshard_after_backward: true
@@ -66,7 +66,7 @@ plan_overrides:
       - "model.layers.3.ffn_hc"
     module_type: transformers.models.deepseek_v4.modeling_deepseek_v4.DeepseekV4HyperConnection
     replace_module:
-      _target_: hyper_parallel.components.modules.mhc.PipelinedMhcModule
+      _target_: hyper_parallel.components.modules.mhc.HyperMegaMhcModule
   - match: "model.layers.1.engram"
     module_type: hyper_parallel.models.deepseek_v41.modeling_deepseek_v41.DeepseekV41EngramPlaceholder
     replace_module:
