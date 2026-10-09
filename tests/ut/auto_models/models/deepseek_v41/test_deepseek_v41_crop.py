@@ -83,6 +83,9 @@ from hyper_parallel.models.deepseek_v41.adapter.policies.sharding import (
 from hyper_parallel.models.deepseek_v41.adapter.registration import (
     DEEPSEEK_V41_ADAPTER_SPEC,
 )
+from hyper_parallel.models.deepseek_v41.adapter.validation.cropped_model import (
+    build_deepseek_v41_validation_config,
+)
 from hyper_parallel.models.deepseek_v41.modeling_deepseek_v41 import (
     DeepseekV41Attention,
     DeepseekV41Engram,
@@ -302,6 +305,45 @@ def _tiny_config(
 
 class TestDeepseekV41EngramScaling(unittest.TestCase):
     """Scaled Engram tables retain the source hash-layout invariants."""
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
+    def test_validation_builder_supports_released_lightweight_depth_crop(self):
+        """Build the released four-text-layer, one-vision-layer validation crop.
+
+        Feature: DeepSeek-V4.1 validation crop depth controls.
+        Description: Retain released widths while selecting four text layers and one vision layer.
+        Expectation: Shared-attention, Reindex, Engram, and vision roles remain internally consistent.
+        """
+        with tempfile.TemporaryDirectory() as directory:
+            _write_released_config(directory)
+            assets_path = _write_engram_assets(
+                directory,
+                num_hidden_layers=40,
+                layer_ids=(1, 14),
+                head_dim=32,
+            )
+            config = build_deepseek_v41_validation_config(
+                directory,
+                str(assets_path),
+                num_hidden_layers=4,
+                text_parameter_divisor=1,
+                enable_vision=True,
+                vision_num_hidden_layers=1,
+                vision_parameter_divisor=1,
+                num_routed_experts=16,
+            )
+            model = DeepseekV41ForCausalLM(config)
+
+        self.assertEqual(config.num_hidden_layers, 4)
+        self.assertEqual(config.hidden_size, 256)
+        self.assertEqual(config.v41_vision_num_hidden_layers, 1)
+        self.assertEqual(config.v41_kv_source_layer_ids, [2])
+        self.assertEqual(config.v41_index_source_layer_ids, [2, 3])
+        self.assertEqual(config.v41_candidate_source_layer_id, 2)
+        self.assertEqual(config.v41_engram_layer_ids, [1])
+        self.assertTrue(hasattr(model.model.layers[1], "engram"))
+        self.assertFalse(hasattr(model.model.layers[3], "engram"))
 
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
