@@ -185,7 +185,7 @@ class RuntimeConfigC(ctypes.Structure):
         ("task_capacity", ctypes.c_uint32),
         ("event_capacity", ctypes.c_uint32),
         ("ready_event", ctypes.c_uint32),
-        ("cycle_profiling_enabled", ctypes.c_uint32),
+        ("diagnostic_mode", ctypes.c_uint32),
         ("aic_profile_record_capacity", ctypes.c_uint32),
         ("aiv_profile_record_capacity", ctypes.c_uint32),
         ("_padding", ctypes.c_uint32 * 8),

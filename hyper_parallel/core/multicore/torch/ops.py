@@ -249,7 +249,7 @@ def mega_moe_grad(
     )
 
 
-def mega_moe_with_profile_buffer(
+def mega_moe_with_diagnostic_buffer(
     dispatch_target: torch.Tensor,
     dispatch_target_off: torch.Tensor,
     dispatch_src: torch.Tensor,
@@ -272,7 +272,7 @@ def mega_moe_with_profile_buffer(
     down_proj_tiling: torch.Tensor,
     runtime_config: torch.Tensor,
     all_event_counters: torch.Tensor,
-    profile_buffer: torch.Tensor,
+    diagnostic_buffer: torch.Tensor,
     rank_id: int,
     ep: int,
     expert_num: int,
@@ -280,14 +280,14 @@ def mega_moe_with_profile_buffer(
     seq_size: int,
 ) -> None:
     """
-    Launch the internal forward ABI with a profiler-owned ordinary NPU buffer.
+    Launch the internal forward ABI with a shared diagnostic-buffer argument.
 
     Writes in-place to: dispatch_target, up_proj_y, swiglu_out, down_proj_y,
                         combine_target.
     All output tensors must be pre-allocated with correct shapes.
 
     Args:
-        dispatch_target: First tensor in the fixed profiled-forward ABI; the complete parameter groups are documented
+        dispatch_target: First tensor in the fixed diagnostic-forward ABI; the complete parameter groups are documented
             below and retain their registered schema order.
 
     Parameters
@@ -309,8 +309,9 @@ def mega_moe_with_profile_buffer(
         Per-rank runtime config tensor (from gen_runtime_data.py).
     all_event_counters :
         Event synchronization counter tensor.
-    profile_buffer :
-        Ordinary NPU memory receiving per-worker cycle records.
+    diagnostic_buffer :
+        Ordinary NPU memory receiving either profiling records or L1 dump
+        snapshots, selected by runtime_config. Unused in ordinary/L0 mode.
     rank_id, ep, expert_num, hidden_size, seq_size :
         Topology / shape attributes.
     """
@@ -338,7 +339,7 @@ def mega_moe_with_profile_buffer(
         down_proj_tiling,
         runtime_config,
         all_event_counters,
-        profile_buffer,
+        diagnostic_buffer,
         rank_id,
         ep,
         expert_num,
@@ -347,7 +348,7 @@ def mega_moe_with_profile_buffer(
     )
 
 
-def mega_moe_grad_with_profile_buffer(
+def mega_moe_grad_with_diagnostic_buffer(
     dispatch_target: torch.Tensor,
     dispatch_target_off: torch.Tensor,
     dy: torch.Tensor,
@@ -377,22 +378,23 @@ def mega_moe_grad_with_profile_buffer(
     swiglu_grad_workspace: torch.Tensor,
     runtime_config: torch.Tensor,
     all_event_counters: torch.Tensor,
-    profile_buffer: torch.Tensor,
+    diagnostic_buffer: torch.Tensor,
     rank_id: int,
     ep: int,
     expert_num: int,
     hidden_size: int,
     seq_size: int,
 ) -> None:
-    """Launch the profiled MoE-FFN backward ABI.
+    """Launch the diagnostic MoE-FFN backward ABI.
 
     The argument contract matches :func:`mega_moe_grad` with one additional
-    ordinary-NPU-memory ``profile_buffer``. Device workers write cycle records
-    directly into that buffer. All output and workspace tensors remain
+    ordinary-NPU-memory ``diagnostic_buffer``. Device workers write profiling
+    records or L1 dump snapshots according to runtime_config; ordinary/L0 mode
+    does not access the buffer. All output and workspace tensors remain
     caller-owned and are written in place.
 
     Args:
-        dispatch_target: First tensor in the fixed profiled-backward ABI; remaining tensor and topology arguments
+        dispatch_target: First tensor in the fixed diagnostic-backward ABI; remaining tensor and topology arguments
             retain their registered schema order.
     """
     _load_native()
@@ -426,7 +428,7 @@ def mega_moe_grad_with_profile_buffer(
         swiglu_grad_workspace,
         runtime_config,
         all_event_counters,
-        profile_buffer,
+        diagnostic_buffer,
         rank_id,
         ep,
         expert_num,

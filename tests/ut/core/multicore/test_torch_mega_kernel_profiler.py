@@ -14,24 +14,42 @@
 # ============================================================================
 """Unit tests for the standalone Torch MegaKernel profiler frontend."""
 
+from __future__ import annotations
+
 import inspect
 import json
 from pathlib import Path
 import tempfile
 import unittest
+from typing import Any
 from unittest.mock import patch
 
-from hyper_parallel.core.multicore.profiler import ProfilerAction, profiler as torch_profiler
+from hyper_parallel.core.multicore.diagnostics.common.session import _reset_active_session_for_test
+from hyper_parallel.core.multicore.diagnostics import DiagnosticAction, schedule
+from hyper_parallel.core.multicore.diagnostics.profiler import api as torch_profiler
+from hyper_parallel.core.multicore.diagnostics.common.call import DiagnosticCall, LaunchArguments
+from hyper_parallel.core.multicore.diagnostics.common.session import _get_active_session
 from hyper_parallel.core.multicore.torch import ops as multicore_adapter
+
+
+def _prepare_profile_call(runtime, *, direction, fallback_event_counters):
+    """Test private profiler lifecycle with a synthetic prepared trace runtime."""
+    session = _get_active_session("profiler")
+    if session is None:
+        return DiagnosticCall(LaunchArguments(
+            runtime.normal_tensor, fallback_event_counters, fallback_event_counters, fallback_event_counters,
+        ))
+    return session.acquire_call(runtime, fallback_event_counters, direction)
 
 
 class _FakeStorage:
     """Track explicit release of a fake tensor storage."""
 
-    def __init__(self):
+    def __init__(self) -> None:
+        """Initialize isolated fake lifecycle state."""
         self.released = False
 
-    def resize_(self, size):
+    def resize_(self, size: int) -> None:
         """Record whether the storage was resized to zero."""
         self.released = size == 0
 
@@ -39,10 +57,11 @@ class _FakeStorage:
 class _FakeArray:
     """Array-like wrapper exposing a byte conversion."""
 
-    def __init__(self, data):
+    def __init__(self, data: bytes) -> None:
+        """Store synthetic device bytes for lifecycle assertions."""
         self._data = data
 
-    def tobytes(self):
+    def tobytes(self) -> bytes:
         """Return the synthetic Host payload."""
         return self._data
 
@@ -50,27 +69,28 @@ class _FakeArray:
 class _FakeProfileBuffer:
     """Small tensor-like profile buffer used by profiler lifecycle tests."""
 
-    def __init__(self, data):
+    def __init__(self, data: bytes) -> None:
+        """Store synthetic device bytes for lifecycle assertions."""
         self._data = data
         self.storage = _FakeStorage()
         self.cpu_calls = 0
         self.zero_calls = 0
 
-    def cpu(self):
+    def cpu(self) -> _FakeProfileBuffer:
         """Record a simulated Device-to-Host transfer."""
         self.cpu_calls += 1
         return self
 
-    def zero_(self):
+    def zero_(self) -> _FakeProfileBuffer:
         """Record buffer initialization and return the tensor-like object."""
         self.zero_calls += 1
         return self
 
-    def numpy(self):
+    def numpy(self) -> _FakeArray:
         """Return an array-like wrapper for the synthetic payload."""
         return _FakeArray(self._data)
 
-    def untyped_storage(self):
+    def untyped_storage(self) -> _FakeStorage:
         """Return the storage object used to verify explicit release."""
         return self.storage
 
@@ -78,11 +98,13 @@ class _FakeProfileBuffer:
 class _FakeBuffer:
     """Event-counter stand-in that records requested slices."""
 
-    def __init__(self):
+    def __init__(self) -> None:
+        """Initialize isolated fake lifecycle state."""
         self.device = "npu:0"
         self.requested_slices = []
 
-    def __getitem__(self, key):
+    def __getitem__(self, key: Any) -> tuple[str, Any]:
+        """Record unexpected slicing of the event buffer."""
         self.requested_slices.append(key)
         return ("view", key)
 
@@ -97,10 +119,11 @@ class _FakeRuntime:
     kernel_name = "FakeMegaKernel"
     buffer_size = 4
 
-    def __init__(self):
+    def __init__(self) -> None:
+        """Initialize isolated fake lifecycle state."""
         self.parse_calls = []
 
-    def parse(self, data, *, detailed_task_names):
+    def parse(self, data: bytes, *, detailed_task_names: bool) -> dict[str, Any]:
         """Return a deterministic trace for one fake invocation payload."""
         self.parse_calls.append((data, detailed_task_names))
         anchor = int(data.decode("ascii"))
@@ -136,10 +159,11 @@ class _FakeRuntime:
 class _FakeNpu:
     """NPU runtime stand-in that records synchronization calls."""
 
-    def __init__(self):
+    def __init__(self) -> None:
+        """Initialize isolated fake lifecycle state."""
         self.synchronized_devices = []
 
-    def synchronize(self, device_id):
+    def synchronize(self, device_id: int) -> None:
         """Record a simulated NPU synchronization."""
         self.synchronized_devices.append(device_id)
 
@@ -149,7 +173,7 @@ class TestMegaKernelSchedule(unittest.TestCase):
 
     def test_schedule_actions(self):
         """Map each configured schedule region to its expected action."""
-        capture_schedule = torch_profiler.schedule(
+        capture_schedule = schedule(
             skip_first=1,
             wait=1,
             warmup=1,
@@ -162,28 +186,29 @@ class TestMegaKernelSchedule(unittest.TestCase):
         self.assertEqual(
             actions,
             [
-                ProfilerAction.NONE,
-                ProfilerAction.NONE,
-                ProfilerAction.WARMUP,
-                ProfilerAction.RECORD,
-                ProfilerAction.RECORD_AND_SAVE,
-                ProfilerAction.NONE,
+                DiagnosticAction.NONE,
+                DiagnosticAction.NONE,
+                DiagnosticAction.WARMUP,
+                DiagnosticAction.RECORD,
+                DiagnosticAction.RECORD_AND_SAVE,
+                DiagnosticAction.NONE,
             ],
         )
 
     def test_schedule_rejects_invalid_values(self):
         """Reject schedule values that cannot form a valid capture cycle."""
         with self.assertRaisesRegex(ValueError, "active must be positive"):
-            torch_profiler.schedule(wait=0, warmup=0, active=0)
+            schedule(wait=0, warmup=0, active=0)
         with self.assertRaisesRegex(ValueError, "wait must be"):
-            torch_profiler.schedule(wait=-1, warmup=0, active=1)
+            schedule(wait=-1, warmup=0, active=1)
 
 
 class TestTorchMegaKernelProfiler(unittest.TestCase):
     """Validate call selection, private Device buffers, D2H boundaries, and export."""
 
-    def tearDown(self):
-        setattr(torch_profiler, "_ACTIVE_PROFILER", None)
+    def tearDown(self) -> None:
+        """Reset the process-local diagnostic session after each test."""
+        _reset_active_session_for_test()
 
     def test_inactive_call_uses_disabled_runtime_without_profile_allocation(self):
         """Keep inactive calls on the disabled RuntimeConfig and fallback buffer."""
@@ -191,7 +216,7 @@ class TestTorchMegaKernelProfiler(unittest.TestCase):
         event_counters = _FakeBuffer()
 
         with patch.object(torch_profiler.torch, "empty") as mock_empty:
-            call = torch_profiler.prepare_mega_kernel_call(
+            call = _prepare_profile_call(
                 runtime,
                 direction="forward",
                 fallback_event_counters=event_counters,
@@ -199,7 +224,7 @@ class TestTorchMegaKernelProfiler(unittest.TestCase):
 
         self.assertEqual(call.runtime_config, runtime.normal_tensor)
         self.assertEqual(call.event_counters, event_counters)
-        self.assertIs(call.profile_buffer, event_counters)
+        self.assertIs(call.diagnostic_buffer, event_counters)
         self.assertEqual(call.clear_event_counters, event_counters)
         self.assertEqual(event_counters.requested_slices, [])
         mock_empty.assert_not_called()
@@ -211,7 +236,7 @@ class TestTorchMegaKernelProfiler(unittest.TestCase):
         fake_npu = _FakeNpu()
         ready = []
         profile_buffer = _FakeProfileBuffer(b"1000")
-        capture_schedule = torch_profiler.schedule(
+        capture_schedule = schedule(
             wait=0,
             warmup=0,
             active=1,
@@ -229,7 +254,7 @@ class TestTorchMegaKernelProfiler(unittest.TestCase):
             patch.object(torch_profiler.torch, "empty", return_value=profile_buffer),
         ):
             with profiler:
-                call = torch_profiler.prepare_mega_kernel_call(
+                call = _prepare_profile_call(
                     runtime,
                     direction="forward",
                     fallback_event_counters=event_counters,
@@ -239,7 +264,7 @@ class TestTorchMegaKernelProfiler(unittest.TestCase):
                     call.clear_event_counters,
                     event_counters,
                 )
-                self.assertIs(call.profile_buffer, profile_buffer)
+                self.assertIs(call.diagnostic_buffer, profile_buffer)
                 self.assertEqual(profile_buffer.zero_calls, 1)
                 call.complete()
                 self.assertEqual(runtime.parse_calls, [])
@@ -276,14 +301,14 @@ class TestTorchMegaKernelProfiler(unittest.TestCase):
             },
         )
 
-    def test_profile_buffer_is_hidden_from_public_low_level_signatures(self):
+    def test_diagnostic_buffer_is_hidden_from_public_low_level_signatures(self):
         """Keep the new native ABI input private to managed MegaMoe execution."""
         self.assertNotIn(
-            "profile_buffer",
+            "diagnostic_buffer",
             inspect.signature(multicore_adapter.mega_moe).parameters,
         )
         self.assertNotIn(
-            "profile_buffer",
+            "diagnostic_buffer",
             inspect.signature(multicore_adapter.mega_moe_grad).parameters,
         )
 
@@ -312,13 +337,13 @@ class TestTorchMegaKernelProfiler(unittest.TestCase):
             ) as mock_empty,
         ):
             with profiler:
-                first = torch_profiler.prepare_mega_kernel_call(
+                first = _prepare_profile_call(
                     runtime, direction="forward", fallback_event_counters=event_counters
                 )
-                second = torch_profiler.prepare_mega_kernel_call(
+                second = _prepare_profile_call(
                     runtime, direction="forward", fallback_event_counters=event_counters
                 )
-                self.assertIsNot(first.profile_buffer, second.profile_buffer)
+                self.assertIsNot(first.diagnostic_buffer, second.diagnostic_buffer)
                 first.complete()
                 second.complete()
 

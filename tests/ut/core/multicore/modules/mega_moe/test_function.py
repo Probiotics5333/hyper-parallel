@@ -21,6 +21,7 @@ from unittest.mock import Mock, PropertyMock, patch
 
 import torch
 
+from hyper_parallel.core.multicore.diagnostics import MegaKernelDiagnostics
 from hyper_parallel.core.multicore.modules.mega_moe import function as function_module
 from hyper_parallel.core.multicore.modules.mega_moe.function import _MegaMoeFunction
 
@@ -66,13 +67,14 @@ class TestMegaMoeFunction(unittest.TestCase):
         """Exercise delayed backward with an optional input permutation boundary."""
         spec = SimpleNamespace(hidden_size=4, intermediate_size=2, rank_id=0,
                                ep_size=2, num_experts=4, local_num_tokens=2, top_k=2)
-        plan = SimpleNamespace(spec=spec)
+        plan = SimpleNamespace(spec=spec, forward_graph=None, backward_graph=None)
         for name in ("up_proj", "swiglu", "down_proj", "act_grad", "gate_grad",
                      "w1_grad", "w2_grad", "swiglu_grad"):
             setattr(plan, f"{name}_tiling", None)
-        runtime = SimpleNamespace(normal_tensor=None)
-        plan.fwd_runtime = runtime
-        plan.bwd_runtime = runtime
+        runtime = SimpleNamespace(normal_tensor=None, kernel_name="mega_moe", rank=0)
+        plan.fwd_diagnostics = MegaKernelDiagnostics(runtime)
+        plan.bwd_diagnostics = MegaKernelDiagnostics(runtime)
+        plan.fwd_runtime_config = plan.bwd_runtime_config = None
         workspace = Mock(
             expert_capacity=128,
             expert_buffer=torch.empty(128, 4),
@@ -141,14 +143,16 @@ class TestMegaMoeFunction(unittest.TestCase):
         outputs = []
         sources = []
         with (
+            patch.object(MegaKernelDiagnostics, "launch",
+                         side_effect=AssertionError("ordinary path must bypass launch")),
             patch.object(
                 function_module.multicore_ops,
-                "mega_moe_with_profile_buffer",
+                "mega_moe",
                 side_effect=forward_kernel,
             ),
             patch.object(
                 function_module.multicore_ops,
-                "mega_moe_grad_with_profile_buffer",
+                "mega_moe_grad",
                 side_effect=backward_kernel,
             ),
             patch.object(function_module.torch_npu, "npu_moe_token_permute_grad_v2",

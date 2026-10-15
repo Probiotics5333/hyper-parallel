@@ -83,7 +83,8 @@ class OperatorNode:
     tiling_position: int
     fill_config:     Any                       # FillConfig subclass instance
     kernel_spec:     Any = None                # reserved for @MultiCore decorator path
-    diagnostic_name: Optional[str] = None      # optional Host-side profiling display name
+    diagnostic_name: Optional[str] = None      # optional Host-side diagnostic display name
+    diagnostic_view_resolver: Optional[Callable[..., Any]] = None
 
     predecessors:    List['OperatorNode'] = field(default_factory=list)
     successors:      List['OperatorNode'] = field(default_factory=list)
@@ -93,7 +94,8 @@ class OperatorNode:
 class ComputeGraph:
     """Directed acyclic graph describing operator execution order."""
 
-    def __init__(self):
+    def __init__(self) -> None:
+        """Initialize an empty graph with stable operator insertion order."""
         self._nodes: dict = {}
         self._insertion_order: list = []
 
@@ -103,7 +105,7 @@ class ComputeGraph:
         self._insertion_order.append(op.name)
         return self
 
-    def add_edge(self, src, dst) -> 'ComputeGraph':
+    def add_edge(self, src: 'OperatorNode | str', dst: 'OperatorNode | str') -> 'ComputeGraph':
         """src / dst can be an OperatorNode or a name string."""
         s = src if isinstance(src, OperatorNode) else self._nodes[src]
         d = dst if isinstance(dst, OperatorNode) else self._nodes[dst]

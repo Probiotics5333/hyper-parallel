@@ -155,7 +155,7 @@ def serialize_runtime_config(cfg: RuntimeConfigC) -> bytes:
         capacity,
         event_capacity,
         cfg.ready_event,
-        cfg.cycle_profiling_enabled,
+        cfg.diagnostic_mode,
         cfg.aic_profile_record_capacity,
         cfg.aiv_profile_record_capacity,
     )

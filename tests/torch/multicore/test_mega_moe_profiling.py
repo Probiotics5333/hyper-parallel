@@ -50,10 +50,10 @@ def _prepare_torch_multicore_test_environment() -> None:
 def test_mega_moe_standalone_profiler(monkeypatch, tmp_path: Path) -> None:
     """Export complete steady-state forward traces for both ranks."""
     _prepare_torch_multicore_test_environment()
-    monkeypatch.delenv("SYMMETRIC_MEMORY_HEAP_SIZE", raising=False)
+    monkeypatch.delenv("HYPER_PARALLEL_SHMEM_HEAP_SIZE", raising=False)
     monkeypatch.setenv("HP_MEGA_MOE_WORLD_SIZE", str(_WORLD_SIZE))
     monkeypatch.setenv("HP_MEGA_MOE_PROFILE_RESULT_DIR", str(tmp_path))
-    monkeypatch.setenv("SHMEM_IP_PORT", f"tcp://127.0.0.1:{allocate_port()}")
+    monkeypatch.setenv("HYPER_PARALLEL_SHMEM_BOOTSTRAP_ENDPOINT", f"tcp://127.0.0.1:{allocate_port()}")
     with without_inherited_rank_environment():
         parallel_run(
             [

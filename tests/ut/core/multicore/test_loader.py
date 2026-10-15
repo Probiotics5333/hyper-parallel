@@ -15,6 +15,7 @@
 """Unit tests for unified multicore payload lookup and OPP diagnostics."""
 
 import os
+import re
 import shutil
 import tempfile
 import unittest
@@ -81,7 +82,7 @@ class TestMulticoreNative(unittest.TestCase):
             _loader, "_component_root", return_value=self.native_root
         ), self.assertRaisesRegex(
             NativeComponentUnavailableError,
-            f"HP-NATIVE-OPP-NOT-ACTIVATED.*source {self.native_root / 'set_env.bash'}",
+            f"HP-NATIVE-OPP-NOT-ACTIVATED.*source {re.escape(str(self.native_root / 'set_env.bash'))}",
         ):
             _loader.require_multicore_environment()
 
@@ -93,6 +94,6 @@ class TestMulticoreNative(unittest.TestCase):
             _loader, "_component_root", return_value=self.native_root
         ), self.assertRaisesRegex(
             NativeComponentUnavailableError,
-            f"HP-NATIVE-OPP-ACTIVATION-TOO-LATE.*source {self.native_root / 'set_env.bash'}",
+            f"HP-NATIVE-OPP-ACTIVATION-TOO-LATE.*source {re.escape(str(self.native_root / 'set_env.bash'))}",
         ):
             _loader.require_multicore_environment()

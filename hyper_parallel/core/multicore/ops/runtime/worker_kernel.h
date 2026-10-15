@@ -1,5 +1,5 @@
 /**
- * Copyright (c) Huawei Technologies Co., Ltd. 2025. All rights reserved.
+ * Copyright (c) Huawei Technologies Co., Ltd. 2025-2026. All rights reserved.
  * This file is a part of the CANN Open Software.
  * Licensed under CANN Open Software License Agreement Version 1.0 (the "License").
  * Please refer to the License for details. You may not use this file except in compliance with the License.
@@ -16,7 +16,7 @@
  *   - static constexpr uint32_t TILING_IDX  — index into input_list for tiling params
  *   - static constexpr uint32_t EVENT_IDX   — index into input_list for all_event_counters
  *   - void ExecuteComputeKernel(TaskDesc)    — op-specific task dispatch switch
- *   - static constexpr uint32_t PROFILE_IDX — index into input_list for the ordinary profile buffer
+ *   - static constexpr uint32_t DIAGNOSTIC_IDX — index into input_list for the shared profiling/dump buffer
  *
  * Compute kernels (ExecuteMatmul, ExecuteShmemPutMem, etc.) are NOT part of this class;
  * they belong in each op's worker_kernel.cpp.
@@ -28,6 +28,7 @@
 #include "kernel_operator.h"
 #include "runtime_config.hpp"
 #include "cycle_trace_recorder.h"
+#include "l1_tensor_dump.h"
 
 using namespace AscendC;  // NOLINT(build/namespaces)
 
@@ -86,12 +87,16 @@ class KernelWorkerBase {
     if (LoadReadyHandshakeMeta(&meta)) {
       WaitForDeviceReady(meta);
     }
-    bool profile_enabled = isCycleProfileEnabled(this->runtimeConfigPtr);
-    if (profile_enabled) {
-      ProcessProfiled();
-      return;
+    switch (getDiagnosticMode(this->runtimeConfigPtr)) {
+      case DiagnosticMode::PROFILE:
+        ProcessProfiled();
+        return;
+      case DiagnosticMode::TENSOR_DUMP_L1:
+        ProcessL1Dump();
+        return;
+      default:
+        ProcessFast();
     }
-    ProcessFast();
   }
 
  protected:
@@ -123,9 +128,37 @@ class KernelWorkerBase {
 #endif
   }
 
+  __aicore__ inline void ProcessL1Dump() {
+#ifdef __DAV_C220_CUBE__
+    uint32_t block_idx = this->worker_id_;
+    do {
+      if (block_idx >= this->cube_task_num) {
+        return;
+      }
+      TaskId task_index = GetTaskIndex(block_idx);
+      ExecuteTaskL1Dump(task_index);
+      block_idx = block_idx + this->core_num;
+    } while (1);
+#else
+    if (this->worker_id_ % VECTOR_WORKER_STRIDE == 0) {
+      return;
+    }
+    uint32_t block_idx = this->worker_id_ / VECTOR_WORKER_STRIDE;
+    do {
+      if (block_idx >= this->vector_task_num) {
+        return;
+      }
+      TaskId task_index = GetTaskIndex(block_idx);
+      ExecuteTaskL1Dump(task_index);
+      uint32_t half_num = this->vector_num / VECTOR_WORKER_STRIDE;
+      block_idx = block_idx + half_num;
+    } while (1);
+#endif
+  }
+
   __aicore__ inline void ProcessProfiled() {
     CycleTraceRecorder cycle_trace_recorder;
-    cycle_trace_recorder.Init(this->worker_id_, this->input_list[Derived::PROFILE_IDX],
+    cycle_trace_recorder.Init(this->worker_id_, this->input_list[Derived::DIAGNOSTIC_IDX],
                               getAicProfileRecordCapacity(this->runtimeConfigPtr),
                               getAivProfileRecordCapacity(this->runtimeConfigPtr));
 #ifdef __DAV_C220_CUBE__
@@ -261,6 +294,84 @@ class KernelWorkerBase {
     static_cast<Derived *>(this)->ExecuteComputeKernel(task_desc);
     if (task_desc.task_type != TaskType::TASK_SHMEM_PUT_MEM_SIGNAL) {
       TriggerEvent(task_desc.trigger_event);
+    }
+  }
+
+  __aicore__ inline void ExecuteTaskL1Dump(TaskId task_id) {
+    if (task_id >= runtime_task_capacity) {
+      AscendC::Trap();
+    }
+    TaskDesc task_desc;
+    getTaskDesc(this->runtimeConfigPtr, &(task_desc), task_id);
+    if ((task_desc.dependent_event != EVENT_INVALID_ID && task_desc.dependent_event >= runtime_event_capacity) ||
+        static_cast<uint64_t>(task_desc.trigger_event) + ATOMIC_ADD_VALUE_LEN > runtime_event_capacity) {
+      AscendC::Trap();
+    }
+    if (task_desc.dependent_event != EVENT_INVALID_ID) {
+      WaitForDependency(task_desc.dependent_event);
+    }
+    CaptureL1TaskTensors(task_id, L1_DUMP_PHASE_BEFORE);
+    static_cast<Derived *>(this)->ExecuteComputeKernel(task_desc);
+    PipeBarrier<PIPE_ALL>();
+    CaptureL1TaskTensors(task_id, L1_DUMP_PHASE_AFTER);
+    if (task_desc.task_type != TaskType::TASK_SHMEM_PUT_MEM_SIGNAL) {
+      TriggerEvent(task_desc.trigger_event);
+    }
+  }
+
+  __aicore__ inline void CaptureL1TaskTensors(TaskId task_id, uint32_t phase) {
+    __gm__ uint8_t *dump_buffer = (__gm__ uint8_t *)(this->input_list[Derived::DIAGNOSTIC_IDX]);
+    GlobalTensor<uint32_t> header_words;
+    header_words.SetGlobalBuffer((__gm__ uint32_t *)(dump_buffer), sizeof(L1DumpHeader) / sizeof(uint32_t));
+    DataCacheCleanAndInvalid<uint32_t, CacheLine::SINGLE_CACHE_LINE, DcciDst::CACHELINE_OUT>(header_words[0]);
+    PipeBarrier<PIPE_ALL>();
+    if (header_words.GetValue(0) != L1_DUMP_MAGIC || header_words.GetValue(1) != L1_DUMP_VERSION ||
+        header_words.GetValue(2) == 0) {
+      return;
+    }
+    uint32_t record_count = header_words.GetValue(3);
+    uint32_t record_stride = header_words.GetValue(4);
+    uint32_t records_offset = header_words.GetValue(5);
+    uint32_t payload_offset = header_words.GetValue(6);
+    uint32_t total_bytes = header_words.GetValue(7);
+    uint64_t records_end = static_cast<uint64_t>(records_offset) +
+                           static_cast<uint64_t>(record_count) * record_stride;
+    if (record_count > L1_DUMP_MAX_RECORDS || record_stride != sizeof(L1DumpRecord) ||
+        records_offset < sizeof(L1DumpHeader) || records_end > payload_offset || payload_offset > total_bytes) {
+      AscendC::Trap();
+    }
+    for (uint32_t record_index = 0; record_index < record_count; ++record_index) {
+      __gm__ uint8_t *record_address = dump_buffer + records_offset + record_index * record_stride;
+      GlobalTensor<uint32_t> record_words;
+      record_words.SetGlobalBuffer((__gm__ uint32_t *)(record_address), sizeof(L1DumpRecord) / sizeof(uint32_t));
+      DataCacheCleanAndInvalid<uint32_t, CacheLine::SINGLE_CACHE_LINE, DcciDst::CACHELINE_OUT>(record_words[0]);
+      DataCacheCleanAndInvalid<uint32_t, CacheLine::SINGLE_CACHE_LINE, DcciDst::CACHELINE_OUT>(record_words[9]);
+      PipeBarrier<PIPE_ALL>();
+      if (record_words.GetValue(0) != task_id || record_words.GetValue(1) != phase ||
+          record_words.GetValue(7) != L1_DUMP_STATUS_PENDING) {
+        continue;
+      }
+      uint64_t source_offset = static_cast<uint64_t>(record_words.GetValue(3)) |
+                               (static_cast<uint64_t>(record_words.GetValue(4)) << 32);
+      uint32_t parameter_position = record_words.GetValue(2);
+      uint32_t record_payload_offset = record_words.GetValue(5);
+      uint32_t payload_bytes = record_words.GetValue(6);
+      if (record_payload_offset < payload_offset ||
+          static_cast<uint64_t>(record_payload_offset) + payload_bytes > total_bytes) {
+        AscendC::Trap();
+      }
+      if (payload_bytes != 0) {
+        GlobalTensor<uint8_t> source_bytes;
+        GlobalTensor<uint8_t> destination_bytes;
+        source_bytes.SetGlobalBuffer((__gm__ uint8_t *)(this->input_list[parameter_position]) + source_offset,
+                                     payload_bytes);
+        destination_bytes.SetGlobalBuffer(dump_buffer + record_payload_offset, payload_bytes);
+        for (uint32_t byte_index = 0; byte_index < payload_bytes; ++byte_index) {
+          destination_bytes.SetValue(byte_index, source_bytes.GetValue(byte_index));
+        }
+        PipeBarrier<PIPE_ALL>();
+      }
+      record_words.SetValue(7, L1_DUMP_STATUS_CAPTURED);
     }
   }
 
